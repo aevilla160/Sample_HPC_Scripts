@@ -1,0 +1,114 @@
+## Slurm Submission Script for communication intense adaptive mesh refinement loop
+
+
+```shell
+#!/bin/bash
+#SBATCH --job-name=miniAMR_comm_intense
+#SBATCH --partition=<temp_partittion>
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=96G
+#SBATCH --time=0-00:30:00
+#SBATCH --output=miniAMR_comm_intense_%j.stdout
+#SBATCH --error=miniAMR_comm_intense_%j.stderr
+#SBATCH --export=ALL
+
+echo "Job ID: $SLURM_JOB_ID"
+echo "Nodes allocated:"
+scontrol show hostnames $SLURM_JOB_NODELIST
+
+echo "Total MPI ranks: $SLURM_NTASKS"
+echo "MPI ranks per node: $SLURM_NTASKS_PER_NODE"
+echo "CPUs per MPI rank: $SLURM_CPUS_PER_TASK"
+
+module purge
+module load openmpi/4.1.8-oneapi-2025.3.1
+
+# One MPI rank per core, no OpenMP threading
+export OMP_NUM_THREADS=1
+export OMP_PROC_BIND=true
+export OMP_PLACES=cores
+
+# Optional: show OpenMPI binding information
+export OMPI_MCA_hwloc_base_binding_policy=core
+export OMPI_MCA_rmaps_base_mapping_policy=slot
+
+# Path to miniAMR executable
+# Change this if your executable is somewhere else
+MINIAMR_EXE=./miniAMR.x
+
+# Total ranks = 2 nodes * 8 ranks/node = 16
+# Processor grid must satisfy:
+# npx * npy * npz = SLURM_NTASKS
+#
+# For 16 ranks, this gives a 3D-ish decomposition.
+NPX=4
+NPY=2
+NPZ=2
+
+# Communication-intensive miniAMR settings
+#
+# Smaller blocks increase surface-area-to-volume ratio,
+# which increases ghost-zone communication relative to computation.
+NX=8
+NY=8
+NZ=8
+
+# More refinement levels create more blocks and more neighbor exchanges.
+NUM_REFINE=4
+
+# More blocks per rank allows more AMR block activity.
+MAX_BLOCKS=8000
+
+# More timesteps and stages increase repeated communication.
+NUM_TSTEPS=100
+STAGES_PER_TS=40
+
+# More variables increase message payload during ghost exchange.
+NUM_VARS=80
+
+# Communicate variables in smaller groups.
+# Smaller COMM_VARS can increase the number of communication rounds.
+COMM_VARS=2
+
+# 27-point stencil communicates more neighbor directions than 7-point stencil.
+STENCIL=27
+
+echo "Running miniAMR communication-intensive case"
+echo "Executable: ${MINIAMR_EXE}"
+echo "Processor grid: ${NPX} x ${NPY} x ${NPZ}"
+echo "Block size: ${NX} x ${NY} x ${NZ}"
+echo "Refinement levels: ${NUM_REFINE}"
+echo "Max blocks per rank: ${MAX_BLOCKS}"
+echo "Timesteps: ${NUM_TSTEPS}"
+echo "Stages per timestep: ${STAGES_PER_TS}"
+echo "Variables: ${NUM_VARS}"
+echo "Variables communicated per round: ${COMM_VARS}"
+echo "Stencil: ${STENCIL}-point"
+
+echo "Command:"
+echo "srun -n ${SLURM_NTASKS} ${MINIAMR_EXE} \
+  --npx ${NPX} --npy ${NPY} --npz ${NPZ} \
+  --nx ${NX} --ny ${NY} --nz ${NZ} \
+  --num_refine ${NUM_REFINE} \
+  --max_blocks ${MAX_BLOCKS} \
+  --num_tsteps ${NUM_TSTEPS} \
+  --stages_per_ts ${STAGES_PER_TS} \
+  --num_vars ${NUM_VARS} \
+  --comm_vars ${COMM_VARS} \
+  --stencil ${STENCIL} \
+  --report_perf 4"
+
+srun -n ${SLURM_NTASKS} ${MINIAMR_EXE} \
+  --npx ${NPX} --npy ${NPY} --npz ${NPZ} \
+  --nx ${NX} --ny ${NY} --nz ${NZ} \
+  --num_refine ${NUM_REFINE} \
+  --max_blocks ${MAX_BLOCKS} \
+  --num_tsteps ${NUM_TSTEPS} \
+  --stages_per_ts ${STAGES_PER_TS} \
+  --num_vars ${NUM_VARS} \
+  --comm_vars ${COMM_VARS} \
+  --stencil ${STENCIL} \
+  --report_perf 4
+```
