@@ -1,35 +1,53 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=qs_2node_96
+#SBATCH --partition=pbatch
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=96
+#SBATCH --cpus-per-task=1
+#SBATCH --exclusive
+#SBATCH --time=0-01:00:00
+#SBATCH --output=qs_2node_96_%j.stdout
+#SBATCH --error=qs_2node_96_%j.stderr
+#SBATCH --export=ALL
 set -euo pipefail
 
-# Quicksilver immediate next-step runner template.
+# Quicksilver 2-node x 96-rank/node runner (blocking vs async termination).
 #
-# Default behavior is a dry run. Configure paths/runtime below, inspect the
-# generated inputs and command files, then run with DRY_RUN=0 when ready.
+# Runs the jobs and collects mpiP profiles only; analysis is run separately
+# after the job finishes. Always launches via srun; no dry-run.
+#
+# Mesh scales with the domain grid (nx = BLOCK*xDom, etc.) so 192 ranks
+# decompose cleanly into BLOCK^3 cells/rank. The physical box is fixed at
+# 100^3 cm, so each rank's subdomain is small relative to the 100 cm MFP,
+# driving heavy cross-rank migration to stress the termination Allreduce.
+
+echo "Job ID: ${SLURM_JOB_ID:-manual}"
+echo "Allocated nodes:"
+scontrol show hostnames "${SLURM_JOB_NODELIST:-$(hostname)}" 2>/dev/null || true
+
+module load openmpi
+
+export OMP_NUM_THREADS=1   # no-op: OpenMP not compiled in (-DHAVE_OPENMP removed)
 
 # ----------------------------- user config ---------------------------------
 
-DRY_RUN="${DRY_RUN:-1}"
-
-QS_ROOT="${QS_ROOT:-/Users/avilla/Downloads/softwares/Quicksilver}"
+QS_ROOT="${QS_ROOT:-/usr/workspace/villa17/software/Quicksilver}"
 QS_EXE_BLOCKING="${QS_EXE_BLOCKING:-${QS_ROOT}/src/qs}"
+# Prebuilt -DHAVE_ASYNC_MPI executable.
 QS_EXE_ASYNC="${QS_EXE_ASYNC:-${QS_ROOT}/src/qs_async}"
-ANALYSIS_PY="${ANALYSIS_PY:-${QS_ROOT}/mpip_scale.py}"
 
 OUT_ROOT="${OUT_ROOT:-${PWD}/quicksilver_next_steps_$(date +%Y%m%d_%H%M%S)}"
 
-# Runtime selection: srun, mpirun, or local.
-# local is only useful for one-rank smoke tests.
-MPI_MODE="${MPI_MODE:-srun}"
-TASKS_PER_NODE="${TASKS_PER_NODE:-1}"
+TASKS_PER_NODE="${TASKS_PER_NODE:-96}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-1}"
 CPU_BIND="${CPU_BIND:-cores}"
 
 USE_MPIP="${USE_MPIP:-1}"
-MPIP_LIB="${MPIP_LIB:-/path/to/libmpiP.so}"
-RUN_ANALYSIS="${RUN_ANALYSIS:-1}"
+MPIP_LIB="${MPIP_LIB:-/usr/workspace/villa17/.local/lib/libmpiP.so}"
 
-RANKS_LIST="${RANKS_LIST:-2 4 8 16}"
-REPS="${REPS:-3}"
+# ranks = TASKS_PER_NODE * nodes. 192 = 2 nodes x 96.
+RANKS_LIST="${RANKS_LIST:-192}"
+REPS="${REPS:-2}"
 
 # Experiments from the immediate plan.
 RUN_BLOCKING_CT0="${RUN_BLOCKING_CT0:-1}"
@@ -39,21 +57,15 @@ RUN_ASYNC_CT0="${RUN_ASYNC_CT0:-1}"
 RUN_BLOCKING_CT1="${RUN_BLOCKING_CT1:-0}"
 RUN_ASYNC_CT1="${RUN_ASYNC_CT1:-0}"
 
-# Build async binary only if requested. Otherwise point QS_EXE_ASYNC at your
-# prebuilt -DHAVE_ASYNC_MPI executable.
-BUILD_ASYNC="${BUILD_ASYNC:-0}"
-ASYNC_CPPFLAGS="${ASYNC_CPPFLAGS:--DHAVE_MPI -DHAVE_ASYNC_MPI}"
-QS_CXXFLAGS="${QS_CXXFLAGS:--std=c++11 -O2}"
-QS_LDFLAGS="${QS_LDFLAGS:-}"
-
 # Quicksilver communication-stress workload knobs.
-PARTICLES_PER_RANK="${PARTICLES_PER_RANK:-1000000}"
-NUM_STEPS="${NUM_STEPS:-100}"
-LOAD_BALANCE="${LOAD_BALANCE:-0}"
+PARTICLES_PER_RANK="${PARTICLES_PER_RANK:-100000}"
+NUM_STEPS="${NUM_STEPS:-50}"
+LOAD_BALANCE="${LOAD_BALANCE:-0}"   # 0 adds a global PopulationControl Allreduce/step
 
-NX="${NX:-10}"
-NY="${NY:-10}"
-NZ="${NZ:-10}"
+# Per-rank mesh block: each rank owns BLOCK^3 cells (guarantees nx>=xDom).
+BLOCK="${BLOCK:-10}"
+
+# Fixed physical box (cm); subdomains shrink as ranks grow.
 LX="${LX:-100}"
 LY="${LY:-100}"
 LZ="${LZ:-100}"
@@ -79,66 +91,36 @@ log() {
   printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"
 }
 
-quote_cmd() {
-  printf '%q ' "$@"
-  printf '\n'
-}
-
+# Balanced 3D domain grid. Product MUST equal ranks (= 96 * nodes).
 rank_grid() {
   case "$1" in
-    1)  printf '1 1 1\n' ;;
-    2)  printf '2 1 1\n' ;;
-    4)  printf '2 2 1\n' ;;
-    8)  printf '2 2 2\n' ;;
-    16) printf '4 2 2\n' ;;
-    32) printf '4 4 2\n' ;;
-    64) printf '4 4 4\n' ;;
+    96)   printf '4 4 6\n'  ;;   # 1 node
+    192)  printf '8 6 4\n'  ;;   # 2 nodes
+    384)  printf '8 8 6\n'  ;;   # 4 nodes
+    768)  printf '8 8 12\n' ;;   # 8 nodes
+    1536) printf '8 12 16\n';;   # 16 nodes
     *)
-      printf 'No domain-grid mapping for %s. Add it in rank_grid().\n' "$1" >&2
+      printf 'No domain-grid mapping for %s ranks. Add it in rank_grid().\n' "$1" >&2
       return 1
       ;;
   esac
 }
 
 require_runtime_config() {
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    return 0
-  fi
-
   if [[ "${USE_MPIP}" -eq 1 && ! -f "${MPIP_LIB}" ]]; then
     printf 'USE_MPIP=1 but MPIP_LIB does not exist: %s\n' "${MPIP_LIB}" >&2
     exit 1
   fi
 }
 
-build_async_if_requested() {
-  if [[ "${BUILD_ASYNC}" -ne 1 ]]; then
-    return 0
-  fi
-
-  local src_dir="${QS_ROOT}/src"
-  local build_cmd=(make -C "${src_dir}" CPPFLAGS="${ASYNC_CPPFLAGS}" CXXFLAGS="${QS_CXXFLAGS}" LDFLAGS="${QS_LDFLAGS}")
-  local copy_cmd=(cp "${src_dir}/qs" "${QS_EXE_ASYNC}")
-
-  log "Async build requested."
-  log "  build: $(quote_cmd "${build_cmd[@]}")"
-  log "  copy:  $(quote_cmd "${copy_cmd[@]}")"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    return 0
-  fi
-
-  "${build_cmd[@]}"
-  "${copy_cmd[@]}"
-}
-
 generate_input() {
   local inp="$1"
   local ranks="$2"
   local cycle_timers="$3"
-  local xdom ydom zdom nparticles
+  local xdom ydom zdom nx ny nz nparticles
 
   read -r xdom ydom zdom < <(rank_grid "${ranks}")
+  nx=$((BLOCK * xdom)); ny=$((BLOCK * ydom)); nz=$((BLOCK * zdom))
   nparticles=$((ranks * PARTICLES_PER_RANK))
 
   cat > "${inp}" <<EOF
@@ -150,9 +132,9 @@ Simulation:
    cycleTimers: ${cycle_timers}
    nParticles: ${nparticles}
    nSteps: ${NUM_STEPS}
-   nx: ${NX}
-   ny: ${NY}
-   nz: ${NZ}
+   nx: ${nx}
+   ny: ${ny}
+   nz: ${nz}
    lx: ${LX}
    ly: ${LY}
    lz: ${LZ}
@@ -205,40 +187,19 @@ build_mpi_command() {
   local nodes="$4"
   local inp="$5"
 
-  case "${MPI_MODE}" in
-    srun)
-      MPI_CMD=(srun
-        --nodes="${nodes}"
-        --ntasks="${ranks}"
-        --ntasks-per-node="${TASKS_PER_NODE}"
-        --cpus-per-task="${CPUS_PER_TASK}"
-      )
-      if [[ -n "${CPU_BIND}" ]]; then
-        MPI_CMD+=(--cpu-bind="${CPU_BIND}")
-      fi
-      if [[ "${USE_MPIP}" -eq 1 ]]; then
-        MPI_CMD+=(--export="ALL,LD_PRELOAD=${MPIP_LIB},MPIP=-k ${case_name}")
-      fi
-      MPI_CMD+=("${exe}" -i "${inp}")
-      ;;
-    mpirun)
-      MPI_CMD=(mpirun -np "${ranks}" "${exe}" -i "${inp}")
-      if [[ "${USE_MPIP}" -eq 1 ]]; then
-        MPI_CMD=(env LD_PRELOAD="${MPIP_LIB}" MPIP="-k ${case_name}" "${MPI_CMD[@]}")
-      fi
-      ;;
-    local)
-      if [[ "${ranks}" -ne 1 ]]; then
-        printf 'MPI_MODE=local only supports ranks=1; got %s\n' "${ranks}" >&2
-        return 1
-      fi
-      MPI_CMD=("${exe}" -i "${inp}")
-      ;;
-    *)
-      printf 'Unknown MPI_MODE=%s. Use srun, mpirun, or local.\n' "${MPI_MODE}" >&2
-      return 1
-      ;;
-  esac
+  MPI_CMD=(srun
+    --nodes="${nodes}"
+    --ntasks="${ranks}"
+    --ntasks-per-node="${TASKS_PER_NODE}"
+    --cpus-per-task="${CPUS_PER_TASK}"
+  )
+  if [[ -n "${CPU_BIND}" ]]; then
+    MPI_CMD+=(--cpu-bind="${CPU_BIND}")
+  fi
+  if [[ "${USE_MPIP}" -eq 1 ]]; then
+    MPI_CMD+=(--export="ALL,LD_PRELOAD=${MPIP_LIB},MPIP=-k ${case_name}")
+  fi
+  MPI_CMD+=("${exe}" -i "${inp}")
 }
 
 run_case() {
@@ -247,7 +208,13 @@ run_case() {
   local cycle_timers="$3"
   local rep_id="$4"
   local ranks="$5"
-  local nodes="${ranks}"
+  local nodes=$((ranks / TASKS_PER_NODE))
+
+  if (( nodes < 1 )); then
+    printf 'ranks=%s < TASKS_PER_NODE=%s; need at least one full node\n' "${ranks}" "${TASKS_PER_NODE}" >&2
+    exit 1
+  fi
+
   local case_name="qs_${exp_name}_${rep_id}_nodes_${nodes}_ranks_${ranks}"
   local case_dir="${OUT_ROOT}/${exp_name}/${rep_id}/qs_nodes_${nodes}_ranks_${ranks}"
   local mpip_dir="${case_dir}/mpiP"
@@ -275,13 +242,8 @@ run_case() {
   } > "${command_file}"
   chmod +x "${command_file}"
 
-  log "Prepared ${case_name}"
+  log "Running ${case_name} (${nodes} nodes x ${TASKS_PER_NODE} ranks/node)"
   log "  input:   ${inp}"
-  log "  command: ${command_file}"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    return 0
-  fi
 
   if [[ ! -x "${exe}" ]]; then
     printf 'Quicksilver executable is not executable: %s\n' "${exe}" >&2
@@ -311,33 +273,11 @@ run_experiment() {
   done
 }
 
-analyze_profiles() {
-  if [[ "${RUN_ANALYSIS}" -ne 1 || "${DRY_RUN}" -eq 1 ]]; then
-    return 0
-  fi
-
-  if [[ ! -f "${ANALYSIS_PY}" ]]; then
-    log "Skipping analysis; ANALYSIS_PY not found: ${ANALYSIS_PY}"
-    return 0
-  fi
-
-  local rep_dir
-  while IFS= read -r rep_dir; do
-    if find "${rep_dir}" -name '*.mpiP' -print -quit | grep -q .; then
-      log "Running mpiP analysis for ${rep_dir}"
-      python3 "${ANALYSIS_PY}" "${rep_dir}" --outdir "${rep_dir}/analysis"
-    fi
-  done < <(find "${OUT_ROOT}" -type d -name 'rep_*' | sort)
-}
-
 main() {
   require_runtime_config
   mkdir -p "${OUT_ROOT}"
 
   log "Output root: ${OUT_ROOT}"
-  log "DRY_RUN=${DRY_RUN}; set DRY_RUN=0 to launch jobs."
-
-  build_async_if_requested
 
   if [[ "${RUN_BLOCKING_CT0}" -eq 1 ]]; then
     run_experiment "blocking_cycleTimers0" "${QS_EXE_BLOCKING}" 0
@@ -352,9 +292,7 @@ main() {
     run_experiment "async_cycleTimers1" "${QS_EXE_ASYNC}" 1
   fi
 
-  analyze_profiles
-
-  log "Done. Inspect ${OUT_ROOT}"
+  log "Done. Profiles under ${OUT_ROOT}; run mpiP analysis separately."
 }
 
 main "$@"
